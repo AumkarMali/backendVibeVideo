@@ -13,6 +13,13 @@ except ImportError:
     COHERE_AVAILABLE = False
     print("Warning: cohere module not available. Chat functionality will be disabled.")
 
+try:
+    from pymongo import MongoClient
+    MONGODB_AVAILABLE = True
+except ImportError:
+    MONGODB_AVAILABLE = False
+    print("Warning: pymongo module not available. Authentication functionality will be disabled.")
+
 from interactive_audio_processor import InteractiveAudioProcessor
 from file_merger import merge_files
 
@@ -83,6 +90,62 @@ iap = InteractiveAudioProcessor(CLEANVOICE_KEY)
 
 co = cohere.Client(COHERE_KEY) if COHERE_KEY and COHERE_AVAILABLE else None
 
+# MongoDB configuration
+MONGODB_URI = os.getenv("MONGODB_URI", "mongodb+srv://chatapp_user:AM20060305!_ilovesushi@cluster0.rw6klmv.mongodb.net/chatapp?retryWrites=true&w=majority&appName=Cluster0")
+DB_NAME = os.getenv("DB_NAME", "chatapp")
+
+# Initialize MongoDB client
+if MONGODB_AVAILABLE:
+    try:
+        mongo_client = MongoClient(MONGODB_URI)
+        mongo_db = mongo_client[DB_NAME]
+        # Test connection
+        mongo_client.admin.command('ping')
+        print("✅ MongoDB connection successful")
+    except Exception as e:
+        print(f"❌ MongoDB connection failed: {e}")
+        MONGODB_AVAILABLE = False
+        mongo_client = None
+        mongo_db = None
+else:
+    mongo_client = None
+    mongo_db = None
+
+# Helper functions for MongoDB operations
+def get_user_chats(username: str, limit: int = 50):
+    """Fetch chats for a given username, sorted by updatedAt desc."""
+    if not MONGODB_AVAILABLE or not mongo_db:
+        return []
+    
+    try:
+        chats = list(
+            mongo_db.chats
+            .find({"username": username})
+            .sort("updatedAt", -1)  # -1 for descending order
+            .limit(limit)
+        )
+        return chats
+    except Exception as e:
+        print(f"Error fetching chats for {username}: {e}")
+        return []
+
+def get_user_library_items(username: str, limit: int = 100):
+    """Fetch library items for a given username, sorted by updatedAt desc."""
+    if not MONGODB_AVAILABLE or not mongo_db:
+        return []
+    
+    try:
+        library_items = list(
+            mongo_db.library_items
+            .find({"username": username})
+            .sort("updatedAt", -1)  # -1 for descending order
+            .limit(limit)
+        )
+        return library_items
+    except Exception as e:
+        print(f"Error fetching library items for {username}: {e}")
+        return []
+
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({"ok": True, "service": "VibeVideo Flask API"}), 200
@@ -90,6 +153,142 @@ def root():
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True})
+
+@app.route("/login", methods=["POST"])
+def login():
+    """
+    Authenticate user against MongoDB database.
+    
+    Expected JSON payload:
+    {
+        "username": "AumkarM",
+        "password": "MySecret123!"
+    }
+    
+    Returns:
+    - 200: Login successful with user info
+    - 401: Invalid credentials
+    - 500: Server error
+    """
+    if not MONGODB_AVAILABLE or not mongo_db:
+        return jsonify({"error": "Database connection not available"}), 500
+    
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+        
+        username = data.get("username", "").strip()
+        password = data.get("password", "").strip()
+        
+        if not username or not password:
+            return jsonify({"error": "Username and password are required"}), 400
+        
+        # Query MongoDB for user
+        user = mongo_db.users.find_one({"username": username})
+        
+        if not user:
+            return jsonify({"error": "Invalid credentials"}), 401
+        
+        # Verify password (in production, you should hash passwords)
+        if user.get("password") != password:
+            return jsonify({"error": "Invalid credentials"}), 401
+        
+        # Remove password from response for security
+        user_response = {
+            "username": user.get("username"),
+            "email": user.get("email"),
+            "createdAt": user.get("createdAt")
+        }
+        
+        # Fetch user's chats and library items
+        chats = get_user_chats(username)
+        library_items = get_user_library_items(username)
+        
+        return jsonify({
+            "message": "Login successful",
+            "user": user_response,
+            "chats": chats,
+            "library_items": library_items
+        }), 200
+        
+    except Exception as e:
+        print(f"Login error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route("/chats", methods=["GET"])
+def get_chats():
+    """
+    Get chats for a specific user.
+    
+    Query parameters:
+    - username: The username to fetch chats for
+    - limit: Maximum number of chats to return (default: 50)
+    
+    Returns:
+    - 200: List of chats for the user
+    - 400: Missing username parameter
+    - 500: Server error
+    """
+    if not MONGODB_AVAILABLE or not mongo_db:
+        return jsonify({"error": "Database connection not available"}), 500
+    
+    username = request.args.get("username")
+    if not username:
+        return jsonify({"error": "Username parameter is required"}), 400
+    
+    try:
+        limit = int(request.args.get("limit", 50))
+        chats = get_user_chats(username, limit)
+        
+        return jsonify({
+            "username": username,
+            "chats": chats,
+            "count": len(chats)
+        }), 200
+        
+    except ValueError:
+        return jsonify({"error": "Invalid limit parameter"}), 400
+    except Exception as e:
+        print(f"Get chats error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route("/library", methods=["GET"])
+def get_library():
+    """
+    Get library items for a specific user.
+    
+    Query parameters:
+    - username: The username to fetch library items for
+    - limit: Maximum number of items to return (default: 100)
+    
+    Returns:
+    - 200: List of library items for the user
+    - 400: Missing username parameter
+    - 500: Server error
+    """
+    if not MONGODB_AVAILABLE or not mongo_db:
+        return jsonify({"error": "Database connection not available"}), 500
+    
+    username = request.args.get("username")
+    if not username:
+        return jsonify({"error": "Username parameter is required"}), 400
+    
+    try:
+        limit = int(request.args.get("limit", 100))
+        library_items = get_user_library_items(username, limit)
+        
+        return jsonify({
+            "username": username,
+            "library_items": library_items,
+            "count": len(library_items)
+        }), 200
+        
+    except ValueError:
+        return jsonify({"error": "Invalid limit parameter"}), 400
+    except Exception as e:
+        print(f"Get library error: {e}")
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/chat", methods=["POST"])
 def chat():
