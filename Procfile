@@ -1,1 +1,2 @@
-web: gunicorn -k uvicorn.workers.UvicornWorker main:app --timeout 600 --log-level info
+web: gunicorn main:app --workers=1 --threads=8 --timeout=600 --log-level info
+
