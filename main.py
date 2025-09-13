@@ -150,35 +150,48 @@ def process():
                 break
             out.write(chunk)
 
-    # Run processing (your class uses async; drive it with asyncio.run)
+    # Run processing and CAPTURE the returned output path
     iap.set_input_file(local_in)
     try:
-        asyncio.run(iap.process_audio_file(command))
+        out_path = asyncio.run(iap.process_audio_file(command))
     finally:
         iap.set_input_file(None)
 
-    # Find output file (input-stem + -<command> + ext)
-    stem = os.path.splitext(os.path.basename(local_in))[0]
-    guess_name = f"{stem}-{command.replace(' ', '-')}{ext}"
-    local_out = os.path.join("/tmp", guess_name)
+    # If the processor didn't return a path, error out
+    if not out_path:
+        return jsonify({"detail": "Processing failed (no output path returned)."}), 500
 
-    if not os.path.exists(local_out):
-        # fallback: find any /tmp file that starts with 'input-' and ends with same ext
-        candidates = [p for p in os.listdir("/tmp") if p.startswith("input-") and p.endswith(ext)]
-        if not candidates:
-            return jsonify({"detail": "Processing finished but output file not found."}), 500
-        candidates.sort(key=lambda n: os.path.getmtime(os.path.join("/tmp", n)))
-        local_out = os.path.join("/tmp", candidates[-1])
+    # Resolve relative vs absolute path; check common locations
+    candidates = []
+    if os.path.isabs(out_path):
+        candidates.append(out_path)
+    else:
+        # try CWD (where InteractiveAudioProcessor likely saved)
+        candidates.append(os.path.join(os.getcwd(), out_path))
+        # also try /tmp just in case
+        candidates.append(os.path.join("/tmp", out_path))
+
+    # final fallback: pattern search for guessed name
+    stem = os.path.splitext(os.path.basename(local_in))[0]  # "input"
+    guess_name = f"{stem}-{command.replace(' ', '-')}{ext}"
+    candidates.append(os.path.join(os.getcwd(), guess_name))
+    candidates.append(os.path.join("/tmp", guess_name))
+
+    # pick the first existing file
+    existing = next((p for p in candidates if os.path.exists(p)), None)
+    if not existing:
+        return jsonify({"detail": "Processing finished but output file not found."}), 500
 
     # Stream as download
     return send_file(
-        local_out,
+        existing,
         mimetype="application/octet-stream",
         as_attachment=True,
-        download_name=os.path.basename(local_out)
+        download_name=os.path.basename(existing)
     )
 
 # ----- Local dev entry (Heroku uses Procfile/Gunicorn) -----
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False)
+
