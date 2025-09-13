@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
 import os
 import re
-import io
-import cohere
-import uvicorn
 import asyncio
 from typing import Optional, List, Tuple
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.middleware.cors import CORSMiddleware
+
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+import cohere  # pip install cohere
 
 from interactive_audio_processor import InteractiveAudioProcessor
 
-# ---------- Behavior / Cohere ----------
+# ---------------- Behavior / model ----------------
 PREAMBLE = (
     "You are VibeVideo.AI, a concise expert assistant for audio and video. "
     "Answer clearly and briefly. If the user asks for an edit, confirm what will be done "
     "in plain language and provide any helpful tips. Do not expose internal commands."
 )
-
 MODEL = os.getenv("COHERE_MODEL", "command-r")
 COHERE_KEY = os.getenv("CO_API_KEY") or os.getenv("COHERE_API_KEY")
 
-# ---------- Phrase → command mapping ----------
+# Natural-language → command mapping
 PHRASE_TO_CMD: List[Tuple[str, str]] = [
     (r"\b(remove|reduce|clean|denoise).*(background\s+noise|noise|hums?|buzz|hiss)\b", "rm bg"),
     (r"\b(remove|trim|cut).*(long\s+)?silence(s)?\b", "rm silence"),
@@ -36,7 +33,7 @@ PHRASE_TO_CMD: List[Tuple[str, str]] = [
     (r"\b(preserve|keep).*(music)\b", "preserve music"),
     (r"\btranscribe|transcription|speech\s*to\s*text\b", "transcribe"),
     (r"\b(apply|do|run|perform|process).*\b(all|comprehensive|everything)\b", "comprehensive"),
-    # power users typing exact tokens:
+    # power-user tokens
     (r"\brm bg\b", "rm bg"),
     (r"\brm silence\b", "rm silence"),
     (r"\brm stutter\b", "rm stutter"),
@@ -50,48 +47,52 @@ PHRASE_TO_CMD: List[Tuple[str, str]] = [
     (r"\btranscribe\b", "transcribe"),
     (r"\bcomprehensive\b", "comprehensive"),
 ]
-
 INTENT_VERBS = [
     "run", "apply", "execute", "perform", "process", "start", "begin", "do",
     "remove", "reduce", "normalize", "enhance", "transcribe", "preserve", "clean", "denoise"
 ]
 
 def _user_has_execute_intent(text: str) -> bool:
-    t = text.strip().lower()
+    t = (text or "").strip().lower()
     return any(v in t for v in INTENT_VERBS)
 
 def _extract_command_from_user(text: str) -> Optional[str]:
-    t = text.strip().lower()
+    t = (text or "").strip().lower()
     for pattern, token in PHRASE_TO_CMD:
         if re.search(pattern, t):
             return token
     return None
 
-# ---------- App ----------
-app = FastAPI(title="VibeVideo API")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # lock to your domain in prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ---------------- App init ----------------
+app = Flask(__name__)
+# Heroku router limit is ~32MB; keep uploads under that
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
+CORS(app)  # allow all origins during dev; restrict in prod
 
 CLEANVOICE_KEY = os.getenv("CLEANVOICE_API_KEY", "FJB8s8nbmY9UQcfeXFeB6tqJmjwDUkKN")
-iap = InteractiveAudioProcessor(CLEANVOICE_KEY)  # uses your existing pipeline
-# (Based on your current class and function map.)  # :contentReference[oaicite:2]{index=2}
+iap = InteractiveAudioProcessor(CLEANVOICE_KEY)
 
 co = cohere.Client(COHERE_KEY) if COHERE_KEY else None
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+# ---------------- Routes ----------------
+@app.route("/")
+def root():
+    # Root is optional; handy to confirm app is alive
+    return jsonify({"ok": True, "service": "VibeVideo Flask API"}), 200
 
-@app.post("/chat")
-def chat(message: str = Form(...)):
-    """Simple chatbot endpoint: returns assistant text."""
-    if not COHERE_KEY:
-        raise HTTPException(500, "COHERE_API_KEY / CO_API_KEY not set")
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"ok": True})
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    if not co:
+        return jsonify({"error": "COHERE_API_KEY / CO_API_KEY not set"}), 500
+    message = request.form.get("message", "").strip()
+    if not message:
+        return jsonify({"error": "Missing 'message'"}), 400
+
+    # Try new Cohere signature first; fallback to legacy if needed
     try:
         resp = co.chat(
             model=MODEL,
@@ -100,7 +101,7 @@ def chat(message: str = Form(...)):
             temperature=0.3,
         )
         text = getattr(resp, "text", None) or getattr(getattr(resp, "message", None), "content", "")
-        return {"message": (text or "").strip()}
+        return jsonify({"message": (text or "").strip()})
     except TypeError:
         resp = co.chat(
             model=MODEL,
@@ -110,74 +111,77 @@ def chat(message: str = Form(...)):
             temperature=0.3,
         )
         text = getattr(resp, "text", None) or getattr(getattr(resp, "message", None), "content", "")
-        return {"message": (text or "").strip()}
+        return jsonify({"message": (text or "").strip()})
 
-@app.post("/process")
-async def process(
-    file: UploadFile = File(...),
-    message: str = Form(...),
-    command: Optional[str] = Form(None)
-):
+@app.route("/process", methods=["POST"])
+def process():
     """
-    Accept a file + user instruction, run the mapped command via InteractiveAudioProcessor,
-    and stream the processed file back.
+    Multipart form:
+      file:   uploaded audio/video
+      message: natural language instruction (e.g., 'remove background noise')
+      command (optional): exact token like 'rm bg'
+    Returns: processed file as attachment
     """
-    # 1) Decide command (unless explicitly supplied)
-    if command is None:
+    uploaded = request.files.get("file")
+    message = request.form.get("message", "")
+    command = request.form.get("command", None)
+
+    if not uploaded or uploaded.filename == "":
+        return jsonify({"detail": "No file uploaded"}), 400
+
+    # Decide command unless explicitly provided
+    if not command:
         if not _user_has_execute_intent(message):
-            return JSONResponse(status_code=400, content={"detail": "No executable intent detected. Try 'remove background noise'."})
+            return jsonify({"detail": "No executable intent detected. Try 'remove background noise'."}), 400
         command = _extract_command_from_user(message)
         if not command:
-            return JSONResponse(status_code=400, content={"detail": "Couldn't map your request to a known command."})
+            return jsonify({"detail": "Couldn't map your request to a known command."}), 400
 
     if command not in iap.function_map:
-        return JSONResponse(status_code=400, content={"detail": f"Unknown command '{command}'."})
+        return jsonify({"detail": f"Unknown command '{command}'."}), 400
 
-    # 2) Save upload to /tmp in chunks (Heroku-safe, avoids big in-memory read)
+    # Save upload to /tmp in chunks
     os.makedirs("/tmp", exist_ok=True)
-    ext = os.path.splitext(file.filename or "input.bin")[1] or ".m4a"
+    _, ext = os.path.splitext(uploaded.filename or "input.bin")
+    ext = ext or ".m4a"
     local_in = os.path.join("/tmp", f"input{ext}")
     with open(local_in, "wb") as out:
         while True:
-            chunk = await file.read(1024 * 1024)
+            chunk = uploaded.stream.read(1024 * 1024)
             if not chunk:
                 break
             out.write(chunk)
 
-    # 3) Process
+    # Run processing (async method; drive with asyncio.run)
     iap.set_input_file(local_in)
     try:
-        await iap.process_audio_file(command)
+        asyncio.run(iap.process_audio_file(command))
     finally:
-        iap.set_input_file(None)  # clear override
+        iap.set_input_file(None)
 
-    # 4) Locate output (input-stem + -<command> + ext)  # :contentReference[oaicite:3]{index=3}
+    # Find output file (input-stem + -<command> + ext)
     stem = os.path.splitext(os.path.basename(local_in))[0]
     guess_name = f"{stem}-{command.replace(' ', '-')}{ext}"
     local_out = os.path.join("/tmp", guess_name)
+
     if not os.path.exists(local_out):
+        # fallback: find any /tmp file that starts with 'input-' and ends with same ext
         candidates = [p for p in os.listdir("/tmp") if p.startswith("input-") and p.endswith(ext)]
         if not candidates:
-            raise HTTPException(500, "Processing finished but output file not found.")
+            return jsonify({"detail": "Processing finished but output file not found."}), 500
         candidates.sort(key=lambda n: os.path.getmtime(os.path.join("/tmp", n)))
         local_out = os.path.join("/tmp", candidates[-1])
 
-    # 5) Stream result
-    def _iterfile():
-        with open(local_out, "rb") as f:
-            while True:
-                data = f.read(1024 * 1024)
-                if not data:
-                    break
-                yield data
-
-    download_name = os.path.basename(local_out)
-    return StreamingResponse(
-        _iterfile(),
-        media_type="application/octet-stream",
-        headers={"Content-Disposition": f'attachment; filename="{download_name}"'}
+    # Stream as download
+    return send_file(
+        local_out,
+        mimetype="application/octet-stream",
+        as_attachment=True,
+        download_name=os.path.basename(local_out)
     )
 
+# --------------- Local dev entry ---------------
 if __name__ == "__main__":
-    # Local run only; Heroku uses Procfile/Gunicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")), reload=True)
+    # Heroku will run via Procfile/gunicorn; this is just for local runs
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
