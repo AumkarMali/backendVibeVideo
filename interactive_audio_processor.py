@@ -3,6 +3,12 @@
 Interactive Audio Processor - Python Version
 A comprehensive audio processing tool using Cleanvoice API
 """
+# NEW imports for merge
+import re
+from typing import List
+import pathlib
+
+# Cloudinary (lazy import inside method if not installed)
 
 import os
 import sys

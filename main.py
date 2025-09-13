@@ -6,9 +6,15 @@ from typing import Optional, List, Tuple
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-import cohere  # pip install cohere
+try:
+    import cohere  # pip install cohere
+    COHERE_AVAILABLE = True
+except ImportError:
+    COHERE_AVAILABLE = False
+    print("Warning: cohere module not available. Chat functionality will be disabled.")
 
 from interactive_audio_processor import InteractiveAudioProcessor
+from file_merger import merge_files
 
 # ---------------- Behavior / model ----------------
 PREAMBLE = (
@@ -33,6 +39,7 @@ PHRASE_TO_CMD: List[Tuple[str, str]] = [
     (r"\b(preserve|keep).*(music)\b", "preserve music"),
     (r"\btranscribe|transcription|speech\s*to\s*text\b", "transcribe"),
     (r"\b(apply|do|run|perform|process).*\b(all|comprehensive|everything)\b", "comprehensive"),
+    (r"\b(merge|combine|join|concatenate|splice).*(audio|video|file|files|clips?)\b", "merge"),
     # power-user tokens
     (r"\brm bg\b", "rm bg"),
     (r"\brm silence\b", "rm silence"),
@@ -46,10 +53,12 @@ PHRASE_TO_CMD: List[Tuple[str, str]] = [
     (r"\bpreserve music\b", "preserve music"),
     (r"\btranscribe\b", "transcribe"),
     (r"\bcomprehensive\b", "comprehensive"),
+    (r"\bmerge\b", "merge"),
 ]
 INTENT_VERBS = [
     "run", "apply", "execute", "perform", "process", "start", "begin", "do",
-    "remove", "reduce", "normalize", "enhance", "transcribe", "preserve", "clean", "denoise"
+    "remove", "reduce", "normalize", "enhance", "transcribe", "preserve", "clean", "denoise",
+    "merge", "combine", "join", "concatenate", "splice"
 ]
 
 def _user_has_execute_intent(text: str) -> bool:
@@ -72,7 +81,7 @@ CORS(app)  # keep permissive during dev; restrict to your domain in prod
 CLEANVOICE_KEY = os.getenv("CLEANVOICE_API_KEY", "FJB8s8nbmY9UQcfeXFeB6tqJmjwDUkKN")
 iap = InteractiveAudioProcessor(CLEANVOICE_KEY)
 
-co = cohere.Client(COHERE_KEY) if COHERE_KEY else None
+co = cohere.Client(COHERE_KEY) if COHERE_KEY and COHERE_AVAILABLE else None
 
 @app.route("/", methods=["GET"])
 def root():
@@ -85,7 +94,7 @@ def health():
 @app.route("/chat", methods=["POST"])
 def chat():
     if not co:
-        return jsonify({"error": "COHERE_API_KEY / CO_API_KEY not set"}), 500
+        return jsonify({"error": "COHERE_API_KEY / CO_API_KEY not set or cohere module not available"}), 500
     message = request.form.get("message", "").strip()
     if not message:
         return jsonify({"error": "Missing 'message'"}), 400
@@ -110,6 +119,90 @@ def chat():
         )
         text = getattr(resp, "text", None) or getattr(getattr(resp, "message", None), "content", "")
         return jsonify({"message": (text or "").strip()})
+
+@app.route("/merge", methods=["POST"])
+def merge():
+    """
+    Multipart form:
+      files: multiple uploaded audio/video files (same type)
+      message: natural language instruction (e.g., 'merge these audio files')
+      order (optional): comma-separated order of files (e.g., '0,2,1,3')
+    Returns: merged file as attachment
+    """
+    uploaded_files = request.files.getlist("files")
+    message = request.form.get("message", "")
+    order = request.form.get("order", None)
+
+    if not uploaded_files or len(uploaded_files) < 2:
+        return jsonify({"detail": "Need at least 2 files to merge"}), 400
+
+    # Filter out empty files
+    uploaded_files = [f for f in uploaded_files if f.filename and f.filename.strip()]
+    
+    if len(uploaded_files) < 2:
+        return jsonify({"detail": "Need at least 2 valid files to merge"}), 400
+
+    # Check if user wants to merge (if message is provided)
+    if message and not _user_has_execute_intent(message):
+        return jsonify({"detail": "No executable intent detected. Try 'merge these audio files'."}), 400
+
+    # Save uploads to /tmp in chunks (Heroku-safe)
+    os.makedirs("/tmp", exist_ok=True)
+    local_files = []
+    
+    try:
+        for i, uploaded in enumerate(uploaded_files):
+            _, ext = os.path.splitext(uploaded.filename or f"input_{i}.bin")
+            ext = ext or ".m4a"
+            local_path = os.path.join("/tmp", f"merge_input_{i}{ext}")
+            
+            with open(local_path, "wb") as out:
+                while True:
+                    chunk = uploaded.stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            
+            local_files.append(local_path)
+
+        # Handle custom ordering if provided
+        if order:
+            try:
+                order_indices = [int(x.strip()) for x in order.split(',')]
+                if len(order_indices) != len(local_files):
+                    return jsonify({"detail": f"Order list length ({len(order_indices)}) doesn't match number of files ({len(local_files)})"}), 400
+                if set(order_indices) != set(range(len(local_files))):
+                    return jsonify({"detail": "Order indices must be unique and cover all files (0-based)"}), 400
+                local_files = [local_files[i] for i in order_indices]
+            except (ValueError, IndexError) as e:
+                return jsonify({"detail": f"Invalid order format: {e}"}), 400
+
+        # Generate output filename
+        first_ext = os.path.splitext(local_files[0])[1]
+        output_filename = f"merged{first_ext}"
+        output_path = os.path.join("/tmp", output_filename)
+
+        # Merge the files
+        merged_path = merge_files(local_files, output_path)
+        
+        # Return the merged file
+        return send_file(
+            merged_path,
+            mimetype="application/octet-stream",
+            as_attachment=True,
+            download_name=output_filename
+        )
+        
+    except Exception as e:
+        return jsonify({"detail": f"Merge failed: {str(e)}"}), 500
+    finally:
+        # Clean up temporary files
+        for local_file in local_files:
+            try:
+                if os.path.exists(local_file):
+                    os.remove(local_file)
+            except:
+                pass
 
 @app.route("/process", methods=["POST"])
 def process():
@@ -194,4 +287,3 @@ def process():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False)
-
