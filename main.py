@@ -71,19 +71,18 @@ def _extract_command_from_user(text: str) -> Optional[str]:
 app = FastAPI(title="VibeVideo API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock this down to your domain in prod
+    allow_origins=["*"],  # lock to your domain in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 CLEANVOICE_KEY = os.getenv("CLEANVOICE_API_KEY", "FJB8s8nbmY9UQcfeXFeB6tqJmjwDUkKN")
-iap = InteractiveAudioProcessor(CLEANVOICE_KEY)  # uses your existing processing pipeline  :contentReference[oaicite:4]{index=4}
+iap = InteractiveAudioProcessor(CLEANVOICE_KEY)  # uses your existing pipeline
+# (Based on your current class and function map.)  # :contentReference[oaicite:2]{index=2}
 
-# Cohere client (optional; only needed for /chat)
 co = cohere.Client(COHERE_KEY) if COHERE_KEY else None
 
-# ---------- Routes ----------
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -93,8 +92,6 @@ def chat(message: str = Form(...)):
     """Simple chatbot endpoint: returns assistant text."""
     if not COHERE_KEY:
         raise HTTPException(500, "COHERE_API_KEY / CO_API_KEY not set")
-
-    # try new SDK signature first; fallback to legacy if needed
     try:
         resp = co.chat(
             model=MODEL,
@@ -105,7 +102,6 @@ def chat(message: str = Form(...)):
         text = getattr(resp, "text", None) or getattr(getattr(resp, "message", None), "content", "")
         return {"message": (text or "").strip()}
     except TypeError:
-        # legacy signature
         resp = co.chat(
             model=MODEL,
             message=message,
@@ -120,65 +116,60 @@ def chat(message: str = Form(...)):
 async def process(
     file: UploadFile = File(...),
     message: str = Form(...),
-    command: Optional[str] = Form(None)  # optional override if you want to force a specific token
+    command: Optional[str] = Form(None)
 ):
     """
     Accept a file + user instruction, run the mapped command via InteractiveAudioProcessor,
-    and stream the processed file back to the frontend.
+    and stream the processed file back.
     """
-    # 1) Decide the command from user message (unless forced)
+    # 1) Decide command (unless explicitly supplied)
     if command is None:
         if not _user_has_execute_intent(message):
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "No executable intent detected. Say things like 'remove background noise' or 'normalize audio'."}
-            )
+            return JSONResponse(status_code=400, content={"detail": "No executable intent detected. Try 'remove background noise'."})
         command = _extract_command_from_user(message)
         if not command:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Couldn't map your request to a known command."}
-            )
+            return JSONResponse(status_code=400, content={"detail": "Couldn't map your request to a known command."})
 
-    # Validate command available
     if command not in iap.function_map:
         return JSONResponse(status_code=400, content={"detail": f"Unknown command '{command}'."})
 
-    # 2) Save upload to /tmp
+    # 2) Save upload to /tmp in chunks (Heroku-safe, avoids big in-memory read)
     os.makedirs("/tmp", exist_ok=True)
     ext = os.path.splitext(file.filename or "input.bin")[1] or ".m4a"
     local_in = os.path.join("/tmp", f"input{ext}")
-    with open(local_in, "wb") as f:
-        f.write(await file.read())
+    with open(local_in, "wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
 
-    # 3) Run processing
-    iap.set_input_file(local_in)  # <— tell the processor to use the uploaded file next
+    # 3) Process
+    iap.set_input_file(local_in)
     try:
         await iap.process_audio_file(command)
     finally:
-        # clear override so future calls don't reuse this file by accident
-        iap.set_input_file(None)  # type: ignore
+        iap.set_input_file(None)  # clear override
 
-    # 4) Find processed output (the class names output as input-stem + "-<command>" + ext)  :contentReference[oaicite:5]{index=5}
+    # 4) Locate output (input-stem + -<command> + ext)  # :contentReference[oaicite:3]{index=3}
     stem = os.path.splitext(os.path.basename(local_in))[0]
     guess_name = f"{stem}-{command.replace(' ', '-')}{ext}"
     local_out = os.path.join("/tmp", guess_name)
     if not os.path.exists(local_out):
-        # fallback: search /tmp for any file starting with 'input-' and same ext
         candidates = [p for p in os.listdir("/tmp") if p.startswith("input-") and p.endswith(ext)]
         if not candidates:
             raise HTTPException(500, "Processing finished but output file not found.")
         candidates.sort(key=lambda n: os.path.getmtime(os.path.join("/tmp", n)))
         local_out = os.path.join("/tmp", candidates[-1])
 
-    # 5) Stream file back to frontend
+    # 5) Stream result
     def _iterfile():
         with open(local_out, "rb") as f:
             while True:
-                chunk = f.read(1024 * 1024)
-                if not chunk:
+                data = f.read(1024 * 1024)
+                if not data:
                     break
-                yield chunk
+                yield data
 
     download_name = os.path.basename(local_out)
     return StreamingResponse(
@@ -188,5 +179,5 @@ async def process(
     )
 
 if __name__ == "__main__":
-    # Local run: uvicorn main:app --reload --port 8080
+    # Local run only; Heroku uses Procfile/Gunicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")), reload=True)
